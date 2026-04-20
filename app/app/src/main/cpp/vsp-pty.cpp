@@ -139,7 +139,16 @@ extern "C"
 
         jbyteArray serialDataArr = gEnv->NewByteArray(dataSize);
         gEnv->SetByteArrayRegion(serialDataArr, 0, dataSize, (jbyte *)val);
-        jobject object = gEnv->NewObject(serialDataClass, serialDataConstructor, serialDataArr, static_cast<jint>(baudrate));
+        jobject object = gEnv->NewObject(
+            serialDataClass, 
+            serialDataConstructor, 
+            serialDataArr, 
+            static_cast<jint>(baudrate),
+            static_cast<jint>(cIflag),
+            static_cast<jint>(cOflag),
+            static_cast<jint>(cCflag),
+            static_cast<jint>(CLflag)
+        );
 
         gEnv->CallVoidMethod(storeWeakListener, stringCallback, object);
         gEnv->DeleteLocalRef(object);
