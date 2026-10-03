@@ -19,6 +19,7 @@ interface MJpegFrameProvider {
     fun registerListener(): Boolean
     fun unregisterListener()
     suspend fun createWebRTCOffer(): Pair<String, String>
+    suspend fun answerWebRTCOffer(offerSdp: String): Pair<String, String>
     suspend fun processWebRTCAnswer(id: String, answerSdp: String): Boolean
     fun addWebRTCIceCandidate(id: String, sdpMid: String?, sdpMLineIndex: Int, sdpCandidate: String)
 }
@@ -97,6 +98,32 @@ class MJpegServer(port: Int, private val frameProvider: MJpegFrameProvider): Nan
                                     responseObj.put("sdp", offerSdp)
                                     responseObj.put("id", id)
                                     responseObj.put("iceServers", org.json.JSONArray())
+                                    val res = newFixedLengthResponse(Response.Status.OK, "application/json", responseObj.toString())
+                                    res.addHeader("Access-Control-Allow-Origin", "*")
+                                    return res
+                                }
+                                "offer" -> {
+                                    // Client is the offerer, as OctoPrint's webrtc:// webcam does
+                                    var id = ""
+                                    var answerSdp = ""
+                                    kotlin.runCatching {
+                                        runBlocking {
+                                            val result = frameProvider.answerWebRTCOffer(jsonObj.optString("sdp", ""))
+                                            id = result.first
+                                            answerSdp = result.second
+                                        }
+                                    }.onFailure { e ->
+                                        e.printStackTrace()
+                                    }
+                                    if (id.isEmpty() || answerSdp.isEmpty()) {
+                                        val res = newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Failed to answer WebRTC offer")
+                                        res.addHeader("Access-Control-Allow-Origin", "*")
+                                        return res
+                                    }
+                                    val responseObj = org.json.JSONObject()
+                                    responseObj.put("type", "answer")
+                                    responseObj.put("sdp", answerSdp)
+                                    responseObj.put("id", id)
                                     val res = newFixedLengthResponse(Response.Status.OK, "application/json", responseObj.toString())
                                     res.addHeader("Access-Control-Allow-Origin", "*")
                                     return res

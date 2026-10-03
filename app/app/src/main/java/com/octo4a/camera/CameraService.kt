@@ -295,6 +295,10 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
       return _webRTCManager.createOffer()
   }
 
+  override suspend fun answerWebRTCOffer(offerSdp: String): Pair<String, String> {
+      return _webRTCManager.answerOffer(offerSdp)
+  }
+
   override suspend fun processWebRTCAnswer(id: String, answerSdp: String): Boolean {
       return _webRTCManager.processAnswer(id, answerSdp)
   }

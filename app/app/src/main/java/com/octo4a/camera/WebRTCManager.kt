@@ -1,13 +1,20 @@
 package com.octo4a.camera
 
 import android.content.Context
+import android.util.Log
 import org.webrtc.*
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
 class WebRTCManager(private val context: Context) {
+    companion object {
+        private const val TAG = "WebRTCManager"
+        // Browsers only expose a track in ontrack's streams if it was added with a stream id
+        private const val STREAM_ID = "octo4a"
+    }
 
     private var eglBase: EglBase? = null
     private var factory: PeerConnectionFactory? = null
@@ -72,6 +79,43 @@ class WebRTCManager(private val context: Context) {
         }
     }
 
+    // Tracks a peer's connection state and calls onGatheringComplete once its local
+    // description has all ICE candidates, so it can be returned in one response.
+    private fun peerObserver(id: String, onGatheringComplete: () -> Unit) = object : PeerConnection.Observer {
+        override fun onSignalingChange(p0: PeerConnection.SignalingState?) {}
+        override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
+            if (state == PeerConnection.IceConnectionState.CONNECTED) {
+                updatePeerStatus(id, true)
+            } else if (state == PeerConnection.IceConnectionState.DISCONNECTED ||
+                state == PeerConnection.IceConnectionState.FAILED ||
+                state == PeerConnection.IceConnectionState.CLOSED) {
+                updatePeerStatus(id, false)
+            }
+        }
+        override fun onIceConnectionReceivingChange(p0: Boolean) {}
+        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
+            if (state == PeerConnection.IceGatheringState.COMPLETE) onGatheringComplete()
+        }
+        override fun onIceCandidate(p0: IceCandidate?) {}
+        override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>?) {}
+        override fun onAddStream(p0: MediaStream?) {}
+        override fun onRemoveStream(p0: MediaStream?) {}
+        override fun onDataChannel(p0: DataChannel?) {}
+        override fun onRenegotiationNeeded() {}
+        override fun onAddTrack(p0: RtpReceiver?, p1: Array<out MediaStream>?) {}
+    }
+
+    // SdpObserver for one create or set call. onSuccess gets the created description, or null after a set.
+    private class SimpleSdpObserver(
+        private val onFailure: (String?) -> Unit,
+        private val onSuccess: (SessionDescription?) -> Unit
+    ) : SdpObserver {
+        override fun onCreateSuccess(sdp: SessionDescription?) = onSuccess(sdp)
+        override fun onSetSuccess() = onSuccess(null)
+        override fun onCreateFailure(error: String?) = onFailure(error)
+        override fun onSetFailure(error: String?) = onFailure(error)
+    }
+
     // Creates an offer (server is the offerer, matching camera-streamer API).
     // Returns a pair of (id, offerSdp). Waits for ICE gathering to complete.
     suspend fun createOffer(): Pair<String, String> = suspendCoroutine { cont ->
@@ -81,35 +125,15 @@ class WebRTCManager(private val context: Context) {
         }
 
         val id = UUID.randomUUID().toString()
-        val resumed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val resumed = AtomicBoolean(false)
 
         val peerConnection = factory?.createPeerConnection(
             PeerConnection.RTCConfiguration(emptyList()),
-            object : PeerConnection.Observer {
-                override fun onSignalingChange(p0: PeerConnection.SignalingState?) {}
-                override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
-                    if (state == PeerConnection.IceConnectionState.CONNECTED) {
-                        updatePeerStatus(id, true)
-                    } else if (state == PeerConnection.IceConnectionState.DISCONNECTED ||
-                        state == PeerConnection.IceConnectionState.FAILED ||
-                        state == PeerConnection.IceConnectionState.CLOSED) {
-                        updatePeerStatus(id, false)
-                    }
+            peerObserver(id) {
+                if (resumed.compareAndSet(false, true)) {
+                    val sdp = peerConnectionsById[id]?.localDescription?.description ?: ""
+                    cont.resume(if (sdp.isNotEmpty()) Pair(id, sdp) else Pair("", ""))
                 }
-                override fun onIceConnectionReceivingChange(p0: Boolean) {}
-                override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
-                    if (state == PeerConnection.IceGatheringState.COMPLETE && resumed.compareAndSet(false, true)) {
-                        val sdp = peerConnectionsById[id]?.localDescription?.description ?: ""
-                        cont.resume(if (sdp.isNotEmpty()) Pair(id, sdp) else Pair("", ""))
-                    }
-                }
-                override fun onIceCandidate(p0: IceCandidate?) {}
-                override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>?) {}
-                override fun onAddStream(p0: MediaStream?) {}
-                override fun onRemoveStream(p0: MediaStream?) {}
-                override fun onDataChannel(p0: DataChannel?) {}
-                override fun onRenegotiationNeeded() {}
-                override fun onAddTrack(p0: RtpReceiver?, p1: Array<out MediaStream>?) {}
             }
         )
 
@@ -144,6 +168,56 @@ class WebRTCManager(private val context: Context) {
                 if (resumed.compareAndSet(false, true)) cont.resume(Pair("", ""))
             }
         }, MediaConstraints())
+    }
+
+    // Answers a client's offer (client is the offerer, as OctoPrint's webrtc:// webcam does).
+    // Returns a pair of (id, answerSdp). Waits for ICE gathering to complete.
+    suspend fun answerOffer(offerSdp: String): Pair<String, String> = suspendCoroutine { cont ->
+        if (factory == null) {
+            cont.resume(Pair("", ""))
+            return@suspendCoroutine
+        }
+
+        val id = UUID.randomUUID().toString()
+        val resumed = AtomicBoolean(false)
+        val fail: (String?) -> Unit = { error ->
+            if (resumed.compareAndSet(false, true)) {
+                Log.w(TAG, "Failed to answer WebRTC offer: $error")
+                peerConnectionsById.remove(id)?.close()
+                cont.resume(Pair("", ""))
+            }
+        }
+
+        // Browsers offer Unified Plan SDP; this library defaults to Plan B
+        val config = PeerConnection.RTCConfiguration(emptyList()).apply {
+            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+        }
+        val peerConnection = factory?.createPeerConnection(config, peerObserver(id) {
+            if (resumed.compareAndSet(false, true)) {
+                val sdp = peerConnectionsById[id]?.localDescription?.description ?: ""
+                cont.resume(if (sdp.isNotEmpty()) Pair(id, sdp) else Pair("", ""))
+            }
+        })
+
+        if (peerConnection == null) {
+            fail("could not create peer connection")
+            return@suspendCoroutine
+        }
+        peerConnectionsById[id] = peerConnection
+
+        peerConnection.setRemoteDescription(SimpleSdpObserver(fail) {
+            // Reuses the recvonly video transceiver from the offer; its audio one stays inactive
+            peerConnection.addTrack(localVideoTrack, listOf(STREAM_ID))
+            peerConnection.createAnswer(SimpleSdpObserver(fail) { answer ->
+                if (answer == null) {
+                    fail("empty answer")
+                } else {
+                    peerConnection.setLocalDescription(SimpleSdpObserver(fail) {
+                        // ICE gathering starts; wait for onIceGatheringChange(COMPLETE)
+                    }, answer)
+                }
+            }, MediaConstraints())
+        }, SessionDescription(SessionDescription.Type.OFFER, offerSdp))
     }
 
     // Sets the client's answer SDP as remote description for the given peer connection id.

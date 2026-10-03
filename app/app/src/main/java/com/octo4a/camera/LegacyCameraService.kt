@@ -46,6 +46,10 @@ class LegacyCameraService : LifecycleService(), MJpegFrameProvider, SurfaceHolde
       return webRTCManager.createOffer()
   }
 
+  override suspend fun answerWebRTCOffer(offerSdp: String): Pair<String, String> {
+      return webRTCManager.answerOffer(offerSdp)
+  }
+
   override suspend fun processWebRTCAnswer(id: String, answerSdp: String): Boolean {
       return webRTCManager.processAnswer(id, answerSdp)
   }
