@@ -45,6 +45,7 @@ import org.webrtc.IceCandidate
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
@@ -97,6 +98,8 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
   private val _cameraBoundUseCases: MutableMap<UseCase, CompletableInitState> = HashMap()
   private var _fpsLimit: Int = -1
   private var _torchRefCnt = AtomicInteger(0)
+  private val _mjpegListenerCnt = AtomicInteger(0)
+  private val _webRTCHoldsCamera = AtomicBoolean(false)
   private val _octoprintHandler: OctoPrintHandlerRepository by inject()
   private val _cameraEnumerationRepository: CameraEnumerationRepository by inject()
   private val _captureExecutor by lazy { Executors.newCachedThreadPool() }
@@ -359,29 +362,37 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
         
     _webRTCManager.pushFrame(nv21, image.width, image.height, image.imageInfo.rotationDegrees)
 
-    var realWidth = image.width
-    var realHeight = image.height
+    // The JPEG encode is the expensive part, so skip it when only WebRTC is watching
+    if (_mjpegListenerCnt.get() > 0) {
+      var realWidth = image.width
+      var realHeight = image.height
 
-    val rotation: Int = image.imageInfo.rotationDegrees
-    if (rotation > 0) {
-      nv21 = RotateUtils.rotate(nv21, realWidth, realHeight, rotation)!!
-      if (rotation != 180) {
-        realWidth = image.height
-        realHeight = image.width
+      val rotation: Int = image.imageInfo.rotationDegrees
+      if (rotation > 0) {
+        nv21 = RotateUtils.rotate(nv21, realWidth, realHeight, rotation)!!
+        if (rotation != 180) {
+          realWidth = image.height
+          realHeight = image.width
+        }
       }
+      setNextFrame(compressNv21(nv21, realWidth, realHeight))
     }
-    setNextFrame(compressNv21(nv21, realWidth, realHeight))
     image.close()
     sleepToLimitFps()
   }
 
   override fun registerListener(): Boolean {
     _logger.log(this) { "Camera server register stream listener" }
-    return initUseCase(_imageAnalysis, block = true)
+    if (!initUseCase(_imageAnalysis, block = true)) {
+      return false
+    }
+    _mjpegListenerCnt.incrementAndGet()
+    return true
   }
 
   override fun unregisterListener() {
     _logger.log(this) { "Camera server unregister stream listener" }
+    _mjpegListenerCnt.decrementAndGet()
     deinitUseCase(_imageAnalysis)
   }
 
@@ -450,11 +461,13 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
     super.onCreate()
     initCameraProvider()
     _webRTCManager.init()
+    // Bind the camera directly: registerListener() would count WebRTC as an MJPEG reader.
+    // Only release a reference we got, or a failed bind would release an MJPEG client's.
     _webRTCManager.onStreamActiveStatusChanged = { active ->
       if (active) {
-        registerListener()
-      } else {
-        unregisterListener()
+        _webRTCHoldsCamera.set(initUseCase(_imageAnalysis, block = true))
+      } else if (_webRTCHoldsCamera.getAndSet(false)) {
+        deinitUseCase(_imageAnalysis)
       }
     }
   }

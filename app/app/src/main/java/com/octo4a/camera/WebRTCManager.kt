@@ -61,7 +61,7 @@ class WebRTCManager(private val context: Context) {
     }
 
     fun pushFrame(nv21: ByteArray, width: Int, height: Int, rotation: Int) {
-        if (factory == null) return
+        if (factory == null || activePeerIds.isEmpty()) return
         try {
             val buffer = NV21Buffer(nv21, width, height, null)
             val frame = VideoFrame(buffer, rotation, System.nanoTime())
