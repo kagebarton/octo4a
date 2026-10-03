@@ -170,6 +170,26 @@ class WebRTCManager(private val context: Context) {
         }, MediaConstraints())
     }
 
+    // Moves H.264 to the front of an SDP's video codec list. The phone sends with the first
+    // codec both sides support, and browsers list VP8 first. This WebRTC build only offers
+    // H.264 when a hardware encoder exists, so preferring it keeps encoding off the CPU.
+    private fun preferH264(sdp: String): String {
+        val lines = sdp.split("\r\n")
+        val h264 = lines.mapNotNull { Regex("^a=rtpmap:(\\d+) H264/90000").find(it)?.groupValues?.get(1) }.toSet()
+        if (h264.isEmpty()) return sdp
+        return lines.joinToString("\r\n") { line ->
+            if (!line.startsWith("m=video ")) {
+                line
+            } else {
+                // m=video <port> <proto> <payload types...>
+                val fields = line.split(" ")
+                val payloadTypes = fields.drop(3)
+                (fields.take(3) + payloadTypes.filter { it in h264 } + payloadTypes.filterNot { it in h264 })
+                    .joinToString(" ")
+            }
+        }
+    }
+
     // Answers a client's offer (client is the offerer, as OctoPrint's webrtc:// webcam does).
     // Returns a pair of (id, answerSdp). Waits for ICE gathering to complete.
     suspend fun answerOffer(offerSdp: String): Pair<String, String> = suspendCoroutine { cont ->
@@ -217,7 +237,7 @@ class WebRTCManager(private val context: Context) {
                     }, answer)
                 }
             }, MediaConstraints())
-        }, SessionDescription(SessionDescription.Type.OFFER, offerSdp))
+        }, SessionDescription(SessionDescription.Type.OFFER, preferH264(offerSdp)))
     }
 
     // Sets the client's answer SDP as remote description for the given peer connection id.
