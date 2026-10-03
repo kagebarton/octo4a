@@ -1,5 +1,6 @@
 package com.octo4a.camera
 
+import android.graphics.Rect
 import android.media.Image
 import android.util.Log
 import androidx.camera.core.ImageProxy
@@ -13,27 +14,30 @@ class NativeCameraUtils {
     }
 
     external fun yuv420toNv21(
-        imageWidth: Int,
-        imageHeight: Int,
+        cropLeft: Int,
+        cropTop: Int,
+        cropWidth: Int,
+        cropHeight: Int,
         yByteBuffer: ByteBuffer?,
         uByteBuffer: ByteBuffer?,
         vByteBuffer: ByteBuffer?,
-        yPixelStride: Int,
         uvPixelStride: Int,
         yRowStride: Int,
         uvRowStride: Int,
         nv21Output: ByteArray?
     ): Boolean
 
-    fun toNv21(image: ImageProxy): ByteArray? {
-        val nv21 = ByteArray((image.width * image.height * 1.5f).toInt())
+    // Converts the crop area of the image to NV21 in one pass. Crop offsets and size must be even.
+    fun toNv21(image: ImageProxy, crop: Rect): ByteArray? {
+        val nv21 = ByteArray(crop.width() * crop.height() * 3 / 2)
         return if (!yuv420toNv21(
-                image.width,
-                image.height,
+                crop.left,
+                crop.top,
+                crop.width(),
+                crop.height(),
                 image.planes[0].buffer,  // Y buffer
                 image.planes[1].buffer,  // U buffer
                 image.planes[2].buffer,  // V buffer
-                image.planes[0].pixelStride,  // Y pixel stride
                 image.planes[1].pixelStride,  // U/V pixel stride
                 image.planes[0].rowStride,  // Y row stride
                 image.planes[1].rowStride,  // U/V row stride

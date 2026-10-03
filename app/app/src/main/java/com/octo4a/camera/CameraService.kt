@@ -279,14 +279,9 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
     }
   }
 
-  // Center-crops an NV21 frame so that, once turned upright, it has the video resolution, or
-  // the largest area of that shape the frame holds. Returns the frame and its size.
-  private fun cropToVideoResolution(
-      nv21: ByteArray,
-      width: Int,
-      height: Int,
-      rotation: Int
-  ): Pair<ByteArray, Size> {
+  // The centered area of a frame that, once turned upright, has the video resolution, or the
+  // largest area of that shape the frame holds
+  private fun videoCrop(width: Int, height: Int, rotation: Int): Rect {
     val quarterTurn = rotation == 90 || rotation == 270
     // The video resolution in the frame's own orientation
     val wantWidth = if (quarterTurn) _videoResolution.height else _videoResolution.width
@@ -295,23 +290,27 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
     // NV21 stores color per 2x2 pixel block, so sizes and offsets must be even
     val cropWidth = (wantWidth * scale).toInt() and 1.inv()
     val cropHeight = (wantHeight * scale).toInt() and 1.inv()
-    if (cropWidth == width && cropHeight == height) {
-      return Pair(nv21, Size(width, height))
-    }
     val left = ((width - cropWidth) / 2) and 1.inv()
     val top = ((height - cropHeight) / 2) and 1.inv()
+    return Rect(left, top, left + cropWidth, top + cropHeight)
+  }
 
-    val cropped = ByteArray(cropWidth * cropHeight * 3 / 2)
-    for (row in 0 until cropHeight) {
-      System.arraycopy(nv21, (top + row) * width + left, cropped, row * cropWidth, cropWidth)
+  // Crops an already converted NV21 frame, for the I420 path that converts in Kotlin
+  private fun cropNv21(nv21: ByteArray, width: Int, height: Int, crop: Rect): ByteArray {
+    if (crop.width() == width && crop.height() == height) {
+      return nv21
+    }
+    val cropped = ByteArray(crop.width() * crop.height() * 3 / 2)
+    for (row in 0 until crop.height()) {
+      System.arraycopy(nv21, (crop.top + row) * width + crop.left, cropped, row * crop.width(), crop.width())
     }
     // Interleaved VU rows follow Y at half the count; an even left keeps each V/U pair whole
     val vuIn = width * height
-    val vuOut = cropWidth * cropHeight
-    for (row in 0 until cropHeight / 2) {
-      System.arraycopy(nv21, vuIn + (top / 2 + row) * width + left, cropped, vuOut + row * cropWidth, cropWidth)
+    val vuOut = crop.width() * crop.height()
+    for (row in 0 until crop.height() / 2) {
+      System.arraycopy(nv21, vuIn + (crop.top / 2 + row) * width + crop.left, cropped, vuOut + row * crop.width(), crop.width())
     }
-    return Pair(cropped, Size(cropWidth, cropHeight))
+    return cropped
   }
 
   private fun getBestAvailFps(): Int {
@@ -435,24 +434,25 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
 
   private fun analyzeFrame(image: ImageProxy) {
     val isI420 = (image.planes[1].pixelStride == 1)
-    val fullFrame: ByteArray =
-        if (isI420) nativeUtils.yuvToNv21Slow(image) else nativeUtils.toNv21(image)!!
     val rotation: Int = image.imageInfo.rotationDegrees
-    val (frame, frameSize) = cropToVideoResolution(fullFrame, image.width, image.height, rotation)
-    var nv21 = frame
+    val crop = videoCrop(image.width, image.height, rotation)
+    // The native path copies only the crop area out of the camera buffers
+    var nv21: ByteArray =
+        if (isI420) cropNv21(nativeUtils.yuvToNv21Slow(image), image.width, image.height, crop)
+        else nativeUtils.toNv21(image, crop)!!
 
-    _webRTCManager.pushFrame(nv21, frameSize.width, frameSize.height, rotation)
+    _webRTCManager.pushFrame(nv21, crop.width(), crop.height(), rotation)
 
     // The JPEG encode is the expensive part, so skip it when only WebRTC is watching
     if (_mjpegListenerCnt.get() > 0) {
-      var realWidth = frameSize.width
-      var realHeight = frameSize.height
+      var realWidth = crop.width()
+      var realHeight = crop.height()
 
       if (rotation > 0) {
         nv21 = RotateUtils.rotate(nv21, realWidth, realHeight, rotation)!!
         if (rotation != 180) {
-          realWidth = frameSize.height
-          realHeight = frameSize.width
+          realWidth = crop.height()
+          realHeight = crop.width()
         }
       }
       setNextFrame(compressNv21(nv21, realWidth, realHeight))
