@@ -1,5 +1,5 @@
 name: Build app
-on: workflow_dispatch
+on: [push, workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -36,6 +36,9 @@ jobs:
           keyPassword: ${{ secrets.KEY_PASSWORD }}
         env:
           BUILD_TOOLS_VERSION: ${{ env.BUILD_TOOL_VERSION }}
+      - name: Show signing certificate
+        run: |
+          /usr/local/lib/android/sdk/build-tools/$BUILD_TOOL_VERSION/apksigner verify --print-certs ${{steps.sign_app.outputs.signedReleaseFile}}
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
