@@ -10,7 +10,9 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.os.Binder
@@ -167,8 +169,7 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
   private val _imageAnalysis by lazy {
     val builder =
         ImageAnalysis.Builder()
-            .setTargetResolution(
-                Size.parseSize(_cameraSettings.selectedVideoResolution ?: "1280x720"))
+            .setTargetResolution(analysisTargetResolution())
             .setTargetRotation(getSettingsRotation())
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
 
@@ -238,6 +239,79 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
       270 -> Surface.ROTATION_270
       else -> Surface.ROTATION_0
     }
+  }
+
+  // Upright size of the stream frames (MJPEG and WebRTC)
+  private val _videoResolution by lazy {
+    Size.parseSize(_cameraSettings.selectedVideoResolution ?: "1280x720")
+  }
+
+  // Whether analysis frames need a quarter turn to be upright, as on a portrait phone with a
+  // landscape sensor. CameraX then reads a requested size as upright, so a landscape request
+  // asks for a portrait stream, and CameraX picks shape over size: on the Redmi Note 4 that
+  // turned 1024x768 into a 480x640 stream. Mirrors isRotationNeeded in CameraX 1.0.0's
+  // SupportedSurfaceCombination.
+  private fun framesNeedQuarterTurn(): Boolean {
+    val sensorOrientation = kotlin.runCatching {
+      val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+      cameraManager.getCameraCharacteristics(_cameraSettings.selectedCamera!!)
+          .get(CameraCharacteristics.SENSOR_ORIENTATION)
+    }.getOrNull() ?: return false
+    val targetDegrees = when (getSettingsRotation()) {
+      Surface.ROTATION_90 -> 90
+      Surface.ROTATION_180 -> 180
+      Surface.ROTATION_270 -> 270
+      else -> 0
+    }
+    // Front and back cameras turn opposite ways, but both make a quarter turn or neither does
+    return (sensorOrientation + targetDegrees) % 180 != 0
+  }
+
+  // What to ask CameraX for so frames can be cropped to the video resolution. A landscape
+  // resolution on quarter-turned frames needs an upright portrait frame at least that wide,
+  // and CameraX picks the smallest sensor size that covers the request.
+  private fun analysisTargetResolution(): Size {
+    val video = _videoResolution
+    return if (video.width > video.height && framesNeedQuarterTurn()) {
+      Size(video.width, video.width * video.width / video.height)
+    } else {
+      video
+    }
+  }
+
+  // Center-crops an NV21 frame so that, once turned upright, it has the video resolution, or
+  // the largest area of that shape the frame holds. Returns the frame and its size.
+  private fun cropToVideoResolution(
+      nv21: ByteArray,
+      width: Int,
+      height: Int,
+      rotation: Int
+  ): Pair<ByteArray, Size> {
+    val quarterTurn = rotation == 90 || rotation == 270
+    // The video resolution in the frame's own orientation
+    val wantWidth = if (quarterTurn) _videoResolution.height else _videoResolution.width
+    val wantHeight = if (quarterTurn) _videoResolution.width else _videoResolution.height
+    val scale = minOf(1.0, width.toDouble() / wantWidth, height.toDouble() / wantHeight)
+    // NV21 stores color per 2x2 pixel block, so sizes and offsets must be even
+    val cropWidth = (wantWidth * scale).toInt() and 1.inv()
+    val cropHeight = (wantHeight * scale).toInt() and 1.inv()
+    if (cropWidth == width && cropHeight == height) {
+      return Pair(nv21, Size(width, height))
+    }
+    val left = ((width - cropWidth) / 2) and 1.inv()
+    val top = ((height - cropHeight) / 2) and 1.inv()
+
+    val cropped = ByteArray(cropWidth * cropHeight * 3 / 2)
+    for (row in 0 until cropHeight) {
+      System.arraycopy(nv21, (top + row) * width + left, cropped, row * cropWidth, cropWidth)
+    }
+    // Interleaved VU rows follow Y at half the count; an even left keeps each V/U pair whole
+    val vuIn = width * height
+    val vuOut = cropWidth * cropHeight
+    for (row in 0 until cropHeight / 2) {
+      System.arraycopy(nv21, vuIn + (top / 2 + row) * width + left, cropped, vuOut + row * cropWidth, cropWidth)
+    }
+    return Pair(cropped, Size(cropWidth, cropHeight))
   }
 
   private fun getBestAvailFps(): Int {
@@ -361,22 +435,24 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
 
   private fun analyzeFrame(image: ImageProxy) {
     val isI420 = (image.planes[1].pixelStride == 1)
-    var nv21: ByteArray =
+    val fullFrame: ByteArray =
         if (isI420) nativeUtils.yuvToNv21Slow(image) else nativeUtils.toNv21(image)!!
-        
-    _webRTCManager.pushFrame(nv21, image.width, image.height, image.imageInfo.rotationDegrees)
+    val rotation: Int = image.imageInfo.rotationDegrees
+    val (frame, frameSize) = cropToVideoResolution(fullFrame, image.width, image.height, rotation)
+    var nv21 = frame
+
+    _webRTCManager.pushFrame(nv21, frameSize.width, frameSize.height, rotation)
 
     // The JPEG encode is the expensive part, so skip it when only WebRTC is watching
     if (_mjpegListenerCnt.get() > 0) {
-      var realWidth = image.width
-      var realHeight = image.height
+      var realWidth = frameSize.width
+      var realHeight = frameSize.height
 
-      val rotation: Int = image.imageInfo.rotationDegrees
       if (rotation > 0) {
         nv21 = RotateUtils.rotate(nv21, realWidth, realHeight, rotation)!!
         if (rotation != 180) {
-          realWidth = image.height
-          realHeight = image.width
+          realWidth = frameSize.height
+          realHeight = frameSize.width
         }
       }
       setNextFrame(compressNv21(nv21, realWidth, realHeight))
