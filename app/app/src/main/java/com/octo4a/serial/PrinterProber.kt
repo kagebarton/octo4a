@@ -62,6 +62,7 @@ val ftdiDevices = listOf(
 
 val ch341Devices = listOf(
     UsbDeviceId(6790, 29987),// CH341
+    UsbDeviceId(6790, 32832),// CH9340
 )
 
 val cp21xxDevices = listOf<UsbDeviceId>(
