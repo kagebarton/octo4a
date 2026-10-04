@@ -166,12 +166,19 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
     ret
   }
 
+  @SuppressLint("RestrictedApi")
   private val _imageAnalysis by lazy {
     val builder =
         ImageAnalysis.Builder()
             .setTargetResolution(analysisTargetResolution())
             .setTargetRotation(getSettingsRotation())
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+    // CameraX 1.0.0 caps analysis at 1920x1080 by default, which turned a 1280x720 setting on
+    // quarter-turned frames into a 1080x606 stream. Lift the cap to the camera's largest size;
+    // CameraX still picks the smallest size that covers the target.
+    _cameraEnumerationRepository.cameraWithId(_cameraSettings.selectedCamera!!)
+        ?.sizes?.maxByOrNull { it.width * it.height }
+        ?.let { builder.setMaxResolution(Size(it.width, it.height)) }
 
     val ret = builder.build()
     _cameraBoundUseCases[ret] =
