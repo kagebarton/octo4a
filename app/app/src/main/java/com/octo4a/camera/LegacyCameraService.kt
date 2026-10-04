@@ -19,7 +19,6 @@ import com.octo4a.repository.LoggerRepository
 import com.octo4a.repository.OctoPrintHandlerRepository
 import com.octo4a.utils.preferences.MainPreferences
 import org.koin.android.ext.android.inject
-import org.webrtc.IceCandidate
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 import kotlin.coroutines.suspendCoroutine
@@ -40,22 +39,6 @@ class LegacyCameraService : LifecycleService(), MJpegFrameProvider, SurfaceHolde
 
     override fun getNewFrame(prevFrame: MJpegFrameProvider.FrameInfo?): MJpegFrameProvider.FrameInfo {
       return MJpegFrameProvider.FrameInfo(latestFrame, id=-1)
-  }
-
-  override suspend fun createWebRTCOffer(): Pair<String, String> {
-      return webRTCManager.createOffer()
-  }
-
-  override suspend fun answerWebRTCOffer(offerSdp: String): Pair<String, String> {
-      return webRTCManager.answerOffer(offerSdp)
-  }
-
-  override suspend fun processWebRTCAnswer(id: String, answerSdp: String): Boolean {
-      return webRTCManager.processAnswer(id, answerSdp)
-  }
-
-  override fun addWebRTCIceCandidate(id: String, sdpMid: String?, sdpMLineIndex: Int, sdpCandidate: String) {
-      webRTCManager.addIceCandidate(id, IceCandidate(sdpMid, sdpMLineIndex, sdpCandidate))
   }
 
     inner class LocalBinder : Binder() {
@@ -86,7 +69,7 @@ class LegacyCameraService : LifecycleService(), MJpegFrameProvider, SurfaceHolde
         logger.log(this) { "Legacy camera unregister listener" }
     }
 
-    private val mjpegServer by lazy { MJpegServer(5001, this) }
+    private val mjpegServer by lazy { MJpegServer(5001, this, webRTCManager) }
     private val webRTCManager by lazy { WebRTCManager(this) }
 
     private val callbackExecutorPool = Executors.newCachedThreadPool()

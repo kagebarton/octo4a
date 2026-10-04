@@ -43,7 +43,6 @@ import com.octo4a.utils.CancelableTimer
 import com.octo4a.utils.WaitableEvent
 import com.octo4a.utils.preferences.MainPreferences
 import org.koin.android.ext.android.inject
-import org.webrtc.IceCandidate
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
@@ -107,7 +106,7 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
   private val _captureExecutor by lazy { Executors.newCachedThreadPool() }
   private val nativeUtils by lazy { NativeCameraUtils() }
 
-  private val _mjpegServer by lazy { MJpegServer(5001, this) }
+  private val _mjpegServer by lazy { MJpegServer(5001, this, _webRTCManager) }
   private val _webRTCManager by lazy { WebRTCManager(this) }
   private val _callbackExecutorPool by lazy { Executors.newCachedThreadPool() }
   private var _lastImageMilliseconds = System.currentTimeMillis()
@@ -370,22 +369,6 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
 
   inner class LocalBinder : Binder() {
     fun getService(): CameraService = this@CameraService
-  }
-
-  override suspend fun createWebRTCOffer(): Pair<String, String> {
-      return _webRTCManager.createOffer()
-  }
-
-  override suspend fun answerWebRTCOffer(offerSdp: String): Pair<String, String> {
-      return _webRTCManager.answerOffer(offerSdp)
-  }
-
-  override suspend fun processWebRTCAnswer(id: String, answerSdp: String): Boolean {
-      return _webRTCManager.processAnswer(id, answerSdp)
-  }
-
-  override fun addWebRTCIceCandidate(id: String, sdpMid: String?, sdpMLineIndex: Int, sdpCandidate: String) {
-      _webRTCManager.addIceCandidate(id, IceCandidate(sdpMid, sdpMLineIndex, sdpCandidate))
   }
 
   private val binder = LocalBinder()
