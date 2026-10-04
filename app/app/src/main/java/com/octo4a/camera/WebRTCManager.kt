@@ -4,14 +4,18 @@ import android.content.Context
 import android.util.Log
 import org.webrtc.*
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
+// Threading: the factory, the track and every PeerConnection are only used on peerEvents, where
+// peers are looked up by id, so a disposed peer is never touched again. libwebrtc callbacks only
+// post to peerEvents: a peer can't be disposed inside its own callback, and anything a callback
+// throws aborts the process.
 class WebRTCManager(private val context: Context) {
     companion object {
         private const val TAG = "WebRTCManager"
@@ -19,89 +23,124 @@ class WebRTCManager(private val context: Context) {
         private const val STREAM_ID = "octo4a"
         // ICE reports DISCONNECTED on brief network drops and often recovers by itself
         private const val DISCONNECT_GRACE_SECONDS = 15L
+        // Setup only gathers host candidates, which takes well under a second
+        private const val SETUP_TIMEOUT_SECONDS = 10L
+        // ICE can wait forever on a client that never answers our offer, or whose candidates
+        // can't be reached
+        private const val CONNECT_TIMEOUT_SECONDS = 30L
+        // Each peer runs its own encoder
+        private const val MAX_PEERS = 3
     }
 
+    private class Peer(val pc: PeerConnection) {
+        // Set once ICE connects, and kept during the disconnect grace period
+        var connected = false
+        var disconnectTimer: ScheduledFuture<*>? = null
+    }
+
+    private val peerEvents = Executors.newSingleThreadScheduledExecutor { Thread(it, "WebRTCPeerEvents") }
     private var eglBase: EglBase? = null
     private var factory: PeerConnectionFactory? = null
-    private var videoSource: VideoSource? = null
+    @Volatile private var videoSource: VideoSource? = null
     private var localVideoTrack: VideoTrack? = null
+    // Oldest first, for eviction
+    private val peers = LinkedHashMap<String, Peer>()
+    @Volatile private var streaming = false
 
-    private val peerConnectionsById = ConcurrentHashMap<String, PeerConnection>()
+    // Called on peerEvents when the first peer connects and after the last one closes
+    @Volatile var onStreamActiveStatusChanged: ((Boolean) -> Unit)? = null
 
-    var onStreamActiveStatusChanged: ((Boolean) -> Unit)? = null
-    private val activePeerIds = ConcurrentHashMap.newKeySet<String>()
+    // Runs block on peerEvents after delaySeconds, or returns null once released. What block
+    // throws is logged, as the executor would swallow it.
+    private fun schedule(delaySeconds: Long, block: () -> Unit): ScheduledFuture<*>? = try {
+        peerEvents.schedule(Runnable {
+            try {
+                block()
+            } catch (e: Throwable) {
+                Log.e(TAG, "WebRTC peer event failed", e)
+            }
+        }, delaySeconds, TimeUnit.SECONDS)
+    } catch (e: RejectedExecutionException) {
+        null
+    }
 
-    // Runs peer state changes one at a time, off libwebrtc's signaling thread: they can block
-    // on the camera bind, and a disconnect timer's close must not interleave with ICE updates.
-    private val peerEvents = Executors.newSingleThreadScheduledExecutor { Thread(it, "WebRTCPeerEvents") }
-    // Pending closes of peers whose ICE is disconnected. Only used on peerEvents.
-    private val disconnectTimers = HashMap<String, ScheduledFuture<*>>()
+    private fun post(block: () -> Unit) = schedule(0, block)
 
-    // Runs on peerEvents, so the empty/non-empty transitions below can't interleave.
-    private fun updatePeerStatus(id: String, connected: Boolean) {
-        val wasEmpty = activePeerIds.isEmpty()
-        if (connected) {
-            // A CONNECTED queued behind a disconnect timer can arrive after the timer closed the peer
-            if (peerConnectionsById.containsKey(id)) activePeerIds.add(id)
-        } else {
-            activePeerIds.remove(id)
-            peerConnectionsById.remove(id)?.close()
+    private fun updateStreaming() {
+        val active = peers.values.any { it.connected }
+        if (active != streaming) {
+            streaming = active
+            onStreamActiveStatusChanged?.invoke(active)
         }
-        val isEmpty = activePeerIds.isEmpty()
-        if (wasEmpty && !isEmpty) {
-            onStreamActiveStatusChanged?.invoke(true)
-        } else if (!wasEmpty && isEmpty) {
-            onStreamActiveStatusChanged?.invoke(false)
-        }
+    }
+
+    private fun closePeer(id: String, reason: String) {
+        val peer = peers.remove(id) ?: return
+        Log.i(TAG, "Closing WebRTC peer $id: $reason")
+        peer.disconnectTimer?.cancel(false)
+        // Closes it too
+        peer.pc.dispose()
+        updateStreaming()
+    }
+
+    // Makes room for a new peer by closing the oldest one that isn't streaming, else the oldest
+    private fun evictIfFull() {
+        if (peers.size < MAX_PEERS) return
+        val idle = peers.entries.firstOrNull { !it.value.connected || it.value.disconnectTimer != null }
+        closePeer((idle ?: peers.entries.first()).key, "too many peers")
     }
 
     fun init() {
-        PeerConnectionFactory.initialize(
-            PeerConnectionFactory.InitializationOptions.builder(context)
-                .setEnableInternalTracer(true)
-                .createInitializationOptions()
-        )
+        post {
+            PeerConnectionFactory.initialize(
+                PeerConnectionFactory.InitializationOptions.builder(context)
+                    .setEnableInternalTracer(true)
+                    .createInitializationOptions()
+            )
 
-        eglBase = EglBase.create()
-        val options = PeerConnectionFactory.Options()
+            eglBase = EglBase.create()
+            val options = PeerConnectionFactory.Options()
 
-        val defaultVideoEncoderFactory = DefaultVideoEncoderFactory(
-            eglBase?.eglBaseContext,  /* enableIntelVp8Encoder */ true,  /* enableH264HighProfile */ true
-        )
-        val defaultVideoDecoderFactory = DefaultVideoDecoderFactory(eglBase?.eglBaseContext)
+            val defaultVideoEncoderFactory = DefaultVideoEncoderFactory(
+                eglBase?.eglBaseContext,  /* enableIntelVp8Encoder */ true,  /* enableH264HighProfile */ true
+            )
+            val defaultVideoDecoderFactory = DefaultVideoDecoderFactory(eglBase?.eglBaseContext)
 
-        factory = PeerConnectionFactory.builder()
-            .setOptions(options)
-            .setVideoEncoderFactory(defaultVideoEncoderFactory)
-            .setVideoDecoderFactory(defaultVideoDecoderFactory)
-            .createPeerConnectionFactory()
+            factory = PeerConnectionFactory.builder()
+                .setOptions(options)
+                .setVideoEncoderFactory(defaultVideoEncoderFactory)
+                .setVideoDecoderFactory(defaultVideoDecoderFactory)
+                .createPeerConnectionFactory()
 
-        videoSource = factory?.createVideoSource(false)
-        localVideoTrack = factory?.createVideoTrack("100", videoSource)
+            val source = factory?.createVideoSource(false)
+            localVideoTrack = factory?.createVideoTrack("100", source)
+            videoSource = source
+        }
     }
 
     fun pushFrame(nv21: ByteArray, width: Int, height: Int, rotation: Int) {
-        if (factory == null || activePeerIds.isEmpty()) return
+        val source = videoSource
+        if (!streaming || source == null) return
         try {
             val buffer = NV21Buffer(nv21, width, height, null)
             val frame = VideoFrame(buffer, rotation, System.nanoTime())
-            videoSource?.capturerObserver?.onFrameCaptured(frame)
+            source.capturerObserver.onFrameCaptured(frame)
             frame.release()
         } catch (e: Exception) {
             e.printStackTrace()
         }
     }
 
-    // Tracks a peer's connection state and calls onGatheringComplete once its local
+    // Posts a peer's ICE events to peerEvents. onGatheringComplete runs once its local
     // description has all ICE candidates, so it can be returned in one response.
     private fun peerObserver(id: String, onGatheringComplete: () -> Unit) = object : PeerConnection.Observer {
         override fun onSignalingChange(p0: PeerConnection.SignalingState?) {}
         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
-            peerEvents.execute { onIceConnectionState(id, state) }
+            post { onIceConnectionState(id, state) }
         }
         override fun onIceConnectionReceivingChange(p0: Boolean) {}
         override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
-            if (state == PeerConnection.IceGatheringState.COMPLETE) onGatheringComplete()
+            if (state == PeerConnection.IceGatheringState.COMPLETE) post(onGatheringComplete)
         }
         override fun onIceCandidate(p0: IceCandidate?) {}
         override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>?) {}
@@ -112,96 +151,124 @@ class WebRTCManager(private val context: Context) {
         override fun onAddTrack(p0: RtpReceiver?, p1: Array<out MediaStream>?) {}
     }
 
-    // Runs on peerEvents. A DISCONNECTED peer gets time to recover before it's closed: OctoPrint
-    // doesn't reconnect, so closing on a brief drop would freeze its stream until a page reload.
+    // A DISCONNECTED peer gets time to recover before it's closed: OctoPrint doesn't reconnect,
+    // so closing on a brief drop would freeze its stream until a page reload.
     private fun onIceConnectionState(id: String, state: PeerConnection.IceConnectionState?) {
+        val peer = peers[id] ?: return
         when (state) {
             PeerConnection.IceConnectionState.CONNECTED,
             PeerConnection.IceConnectionState.COMPLETED -> {
-                disconnectTimers.remove(id)?.cancel(false)
-                updatePeerStatus(id, true)
+                peer.disconnectTimer?.cancel(false)
+                peer.disconnectTimer = null
+                peer.connected = true
+                updateStreaming()
             }
             PeerConnection.IceConnectionState.DISCONNECTED -> {
-                if (!disconnectTimers.containsKey(id)) {
-                    disconnectTimers[id] = peerEvents.schedule(Runnable {
-                        disconnectTimers.remove(id)
-                        updatePeerStatus(id, false)
-                    }, DISCONNECT_GRACE_SECONDS, TimeUnit.SECONDS)
+                if (peer.disconnectTimer == null) {
+                    peer.disconnectTimer = schedule(DISCONNECT_GRACE_SECONDS) {
+                        closePeer(id, "disconnected for ${DISCONNECT_GRACE_SECONDS}s")
+                    }
                 }
             }
             PeerConnection.IceConnectionState.FAILED,
-            PeerConnection.IceConnectionState.CLOSED -> {
-                disconnectTimers.remove(id)?.cancel(false)
-                updatePeerStatus(id, false)
-            }
+            PeerConnection.IceConnectionState.CLOSED -> closePeer(id, "ICE $state")
             else -> {}
         }
     }
 
-    // SdpObserver for one create or set call. onSuccess gets the created description, or null after a set.
-    private class SimpleSdpObserver(
+    // SdpObserver for one create or set call on peer id. Its callbacks run on peerEvents, and
+    // onSuccess only while the peer is open. onSuccess gets the created description, or null after a set.
+    private inner class SdpCallback(
+        private val id: String,
         private val onFailure: (String?) -> Unit,
         private val onSuccess: (SessionDescription?) -> Unit
     ) : SdpObserver {
-        override fun onCreateSuccess(sdp: SessionDescription?) = onSuccess(sdp)
-        override fun onSetSuccess() = onSuccess(null)
-        override fun onCreateFailure(error: String?) = onFailure(error)
-        override fun onSetFailure(error: String?) = onFailure(error)
+        override fun onCreateSuccess(sdp: SessionDescription?) = succeed(sdp)
+        override fun onSetSuccess() = succeed(null)
+        override fun onCreateFailure(error: String?) = fail(error)
+        override fun onSetFailure(error: String?) = fail(error)
+
+        private fun succeed(sdp: SessionDescription?) {
+            post {
+                if (!peers.containsKey(id)) {
+                    onFailure("peer closed")
+                } else {
+                    try {
+                        onSuccess(sdp)
+                    } catch (e: Throwable) {
+                        onFailure(e.toString())
+                    }
+                }
+            }
+        }
+
+        private fun fail(error: String?) {
+            post { onFailure(error) }
+        }
+    }
+
+    // Runs block on peerEvents and suspends until it calls finish. Gives up with failed if block
+    // throws, after SETUP_TIMEOUT_SECONDS, or once released; later finish calls are ignored.
+    private suspend fun <T> awaitPeerEvents(failed: T, block: (finish: (T) -> Unit) -> Unit): T =
+        suspendCoroutine { cont ->
+            val done = AtomicBoolean(false)
+            val finish: (T) -> Unit = { result -> if (done.compareAndSet(false, true)) cont.resume(result) }
+            val timeout = schedule(SETUP_TIMEOUT_SECONDS) { finish(failed) }
+            val started = post {
+                try {
+                    block(finish)
+                } catch (e: Throwable) {
+                    Log.w(TAG, "WebRTC setup failed", e)
+                    finish(failed)
+                }
+            }
+            if (timeout == null || started == null) finish(failed)
+        }
+
+    // Creates a peer, lets negotiate start its SDP exchange, and returns (id, local SDP) once ICE
+    // gathering is done, or ("", "") on failure. negotiate's callbacks report errors to fail.
+    private suspend fun newPeer(
+        config: PeerConnection.RTCConfiguration,
+        negotiate: (id: String, pc: PeerConnection, fail: (String?) -> Unit) -> Unit
+    ): Pair<String, String> {
+        val id = UUID.randomUUID().toString()
+        val sdp = awaitPeerEvents<String?>(null) { finish ->
+            val fail: (String?) -> Unit = { error ->
+                Log.w(TAG, "WebRTC setup failed: $error")
+                finish(null)
+            }
+            val pc = factory?.createPeerConnection(config, peerObserver(id) {
+                finish(peers[id]?.pc?.localDescription?.description)
+            })
+            if (pc == null) {
+                fail("could not create peer connection")
+            } else {
+                evictIfFull()
+                peers[id] = Peer(pc)
+                schedule(CONNECT_TIMEOUT_SECONDS) {
+                    if (peers[id]?.connected == false) closePeer(id, "not connected after ${CONNECT_TIMEOUT_SECONDS}s")
+                }
+                negotiate(id, pc, fail)
+            }
+        }
+        if (sdp.isNullOrEmpty()) {
+            post { closePeer(id, "setup failed") }
+            return Pair("", "")
+        }
+        return Pair(id, sdp)
     }
 
     // Creates an offer (server is the offerer, matching camera-streamer API).
     // Returns a pair of (id, offerSdp). Waits for ICE gathering to complete.
-    suspend fun createOffer(): Pair<String, String> = suspendCoroutine { cont ->
-        if (factory == null) {
-            cont.resume(Pair("", ""))
-            return@suspendCoroutine
-        }
-
-        val id = UUID.randomUUID().toString()
-        val resumed = AtomicBoolean(false)
-
-        val peerConnection = factory?.createPeerConnection(
-            PeerConnection.RTCConfiguration(emptyList()),
-            peerObserver(id) {
-                if (resumed.compareAndSet(false, true)) {
-                    val sdp = peerConnectionsById[id]?.localDescription?.description ?: ""
-                    cont.resume(if (sdp.isNotEmpty()) Pair(id, sdp) else Pair("", ""))
-                }
-            }
-        )
-
-        if (peerConnection == null) {
-            cont.resume(Pair("", ""))
-            return@suspendCoroutine
-        }
-
-        peerConnection.addTrack(localVideoTrack)
-        peerConnectionsById[id] = peerConnection
-
-        peerConnection.createOffer(object : SdpObserver {
-            override fun onCreateSuccess(offer: SessionDescription?) {
-                peerConnection.setLocalDescription(object : SdpObserver {
-                    override fun onCreateSuccess(p0: SessionDescription?) {}
-                    override fun onSetSuccess() {
-                        // ICE gathering starts; wait for onIceGatheringChange(COMPLETE)
-                    }
-                    override fun onCreateFailure(p0: String?) {
-                        if (resumed.compareAndSet(false, true)) cont.resume(Pair("", ""))
-                    }
-                    override fun onSetFailure(p0: String?) {
-                        if (resumed.compareAndSet(false, true)) cont.resume(Pair("", ""))
-                    }
+    suspend fun createOffer(): Pair<String, String> =
+        newPeer(PeerConnection.RTCConfiguration(emptyList())) { id, pc, fail ->
+            pc.addTrack(localVideoTrack)
+            pc.createOffer(SdpCallback(id, fail) { offer ->
+                pc.setLocalDescription(SdpCallback(id, fail) {
+                    // ICE gathering starts; newPeer returns once it's complete
                 }, offer)
-            }
-            override fun onSetSuccess() {}
-            override fun onCreateFailure(p0: String?) {
-                if (resumed.compareAndSet(false, true)) cont.resume(Pair("", ""))
-            }
-            override fun onSetFailure(p0: String?) {
-                if (resumed.compareAndSet(false, true)) cont.resume(Pair("", ""))
-            }
-        }, MediaConstraints())
-    }
+            }, MediaConstraints())
+        }
 
     // Moves H.264 to the front of an SDP's video codec list. The phone sends with the first
     // codec both sides support, and browsers list VP8 first. This WebRTC build only offers
@@ -225,72 +292,41 @@ class WebRTCManager(private val context: Context) {
 
     // Answers a client's offer (client is the offerer, as OctoPrint's webrtc:// webcam does).
     // Returns a pair of (id, answerSdp). Waits for ICE gathering to complete.
-    suspend fun answerOffer(offerSdp: String): Pair<String, String> = suspendCoroutine { cont ->
-        if (factory == null) {
-            cont.resume(Pair("", ""))
-            return@suspendCoroutine
-        }
-
-        val id = UUID.randomUUID().toString()
-        val resumed = AtomicBoolean(false)
-        val fail: (String?) -> Unit = { error ->
-            if (resumed.compareAndSet(false, true)) {
-                Log.w(TAG, "Failed to answer WebRTC offer: $error")
-                peerConnectionsById.remove(id)?.close()
-                cont.resume(Pair("", ""))
-            }
-        }
-
+    suspend fun answerOffer(offerSdp: String): Pair<String, String> {
         // Browsers offer Unified Plan SDP; this library defaults to Plan B
         val config = PeerConnection.RTCConfiguration(emptyList()).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
         }
-        val peerConnection = factory?.createPeerConnection(config, peerObserver(id) {
-            if (resumed.compareAndSet(false, true)) {
-                val sdp = peerConnectionsById[id]?.localDescription?.description ?: ""
-                cont.resume(if (sdp.isNotEmpty()) Pair(id, sdp) else Pair("", ""))
-            }
-        })
-
-        if (peerConnection == null) {
-            fail("could not create peer connection")
-            return@suspendCoroutine
+        return newPeer(config) { id, pc, fail ->
+            pc.setRemoteDescription(SdpCallback(id, fail) {
+                // Reuses the recvonly video transceiver from the offer; its audio one stays inactive
+                pc.addTrack(localVideoTrack, listOf(STREAM_ID))
+                pc.createAnswer(SdpCallback(id, fail) { answer ->
+                    if (answer == null) {
+                        fail("empty answer")
+                    } else {
+                        pc.setLocalDescription(SdpCallback(id, fail) {
+                            // ICE gathering starts; newPeer returns once it's complete
+                        }, answer)
+                    }
+                }, MediaConstraints())
+            }, SessionDescription(SessionDescription.Type.OFFER, preferH264(offerSdp)))
         }
-        peerConnectionsById[id] = peerConnection
-
-        peerConnection.setRemoteDescription(SimpleSdpObserver(fail) {
-            // Reuses the recvonly video transceiver from the offer; its audio one stays inactive
-            peerConnection.addTrack(localVideoTrack, listOf(STREAM_ID))
-            peerConnection.createAnswer(SimpleSdpObserver(fail) { answer ->
-                if (answer == null) {
-                    fail("empty answer")
-                } else {
-                    peerConnection.setLocalDescription(SimpleSdpObserver(fail) {
-                        // ICE gathering starts; wait for onIceGatheringChange(COMPLETE)
-                    }, answer)
-                }
-            }, MediaConstraints())
-        }, SessionDescription(SessionDescription.Type.OFFER, preferH264(offerSdp)))
     }
 
     // Sets the client's answer SDP as remote description for the given peer connection id.
-    suspend fun processAnswer(id: String, answerSdp: String): Boolean = suspendCoroutine { cont ->
-        val peerConnection = peerConnectionsById[id]
-        if (peerConnection == null) {
-            cont.resume(false)
-            return@suspendCoroutine
+    suspend fun processAnswer(id: String, answerSdp: String): Boolean = awaitPeerEvents(false) { finish ->
+        val pc = peers[id]?.pc
+        if (pc == null) {
+            finish(false)
+        } else {
+            pc.setRemoteDescription(SdpCallback(id, { finish(false) }) { finish(true) },
+                SessionDescription(SessionDescription.Type.ANSWER, answerSdp))
         }
-
-        peerConnection.setRemoteDescription(object : SdpObserver {
-            override fun onCreateSuccess(p0: SessionDescription?) {}
-            override fun onSetSuccess() { cont.resume(true) }
-            override fun onCreateFailure(p0: String?) { cont.resume(false) }
-            override fun onSetFailure(p0: String?) { cont.resume(false) }
-        }, SessionDescription(SessionDescription.Type.ANSWER, answerSdp))
     }
 
     // Adds a remote ICE candidate from the client to the given peer connection.
     fun addIceCandidate(id: String, candidate: IceCandidate) {
-        peerConnectionsById[id]?.addIceCandidate(candidate)
+        post { peers[id]?.pc?.addIceCandidate(candidate) }
     }
 }
