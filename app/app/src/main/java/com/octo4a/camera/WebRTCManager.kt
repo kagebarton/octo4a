@@ -41,7 +41,9 @@ class WebRTCManager(private val context: Context) {
     private val peerEvents = Executors.newSingleThreadScheduledExecutor { Thread(it, "WebRTCPeerEvents") }
     private var eglBase: EglBase? = null
     private var factory: PeerConnectionFactory? = null
-    @Volatile private var videoSource: VideoSource? = null
+    // pushFrame runs on the camera thread, so release swaps the source out under frameLock
+    private val frameLock = Any()
+    private var videoSource: VideoSource? = null
     private var localVideoTrack: VideoTrack? = null
     // Oldest first, for eviction
     private val peers = LinkedHashMap<String, Peer>()
@@ -114,20 +116,46 @@ class WebRTCManager(private val context: Context) {
 
             val source = factory?.createVideoSource(false)
             localVideoTrack = factory?.createVideoTrack("100", source)
-            videoSource = source
+            synchronized(frameLock) { videoSource = source }
         }
     }
 
+    // Closes every peer and frees libwebrtc's objects. The manager can't be used afterwards.
+    fun release() {
+        // The service is going away, and CameraX unbinds the camera with its lifecycle
+        onStreamActiveStatusChanged = null
+        post {
+            for (peer in peers.values) {
+                peer.disconnectTimer?.cancel(false)
+                peer.pc.dispose()
+            }
+            peers.clear()
+            streaming = false
+            val source = synchronized(frameLock) { videoSource.also { videoSource = null } }
+            localVideoTrack?.dispose()
+            source?.dispose()
+            factory?.dispose()
+            eglBase?.release()
+            localVideoTrack = null
+            factory = null
+            eglBase = null
+        }
+        // Tasks already queued or delayed still run, and find no peers
+        peerEvents.shutdown()
+    }
+
     fun pushFrame(nv21: ByteArray, width: Int, height: Int, rotation: Int) {
-        val source = videoSource
-        if (!streaming || source == null) return
-        try {
-            val buffer = NV21Buffer(nv21, width, height, null)
-            val frame = VideoFrame(buffer, rotation, System.nanoTime())
-            source.capturerObserver.onFrameCaptured(frame)
-            frame.release()
-        } catch (e: Exception) {
-            e.printStackTrace()
+        if (!streaming) return
+        synchronized(frameLock) {
+            val source = videoSource ?: return
+            try {
+                val buffer = NV21Buffer(nv21, width, height, null)
+                val frame = VideoFrame(buffer, rotation, System.nanoTime())
+                source.capturerObserver.onFrameCaptured(frame)
+                frame.release()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
     }
 

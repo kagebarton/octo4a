@@ -484,6 +484,7 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
   override fun onDestroy() {
     super.onDestroy()
     Thread { _mjpegServer.stopServer() }.start()
+    _webRTCManager.release()
     _octoprintHandler.isCameraServerRunning = false
   }
 
