@@ -57,6 +57,7 @@ const val UNBIND_DELAY_MS: Long = 5 * 60 * 1000 // Unbind the camera after 5 min
 const val UNBIND_STREAM_DELAY_MS: Long = 10 * 1000 // Unbind streams faster to save CPU
 const val SNAPSHOT_FLASH_DELAY_MS: Long = 1000 // How long to turn flash on before taking snapshot
 const val JPEG_QUALITY: Int = 70
+const val NV21_POOL_SIZE: Int = 2 // A frame holds at most two arrays: WebRTC's and MJPEG's
 
 @RequiresApi(Build.VERSION_CODES.LOLLIPOP)
 class CameraService : LifecycleService(), MJpegFrameProvider {
@@ -111,6 +112,11 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
   private val _webRTCManager by lazy { WebRTCManager(this) }
   private val _callbackExecutorPool by lazy { Executors.newCachedThreadPool() }
   private var _lastImageMilliseconds = System.currentTimeMillis()
+  // Frame arrays are about a megabyte, and allocating two per frame kept the GC busy. WebRTC's
+  // array comes back when libwebrtc releases the frame, usually before pushFrame returns.
+  private val _nv21Pool = ArrayDeque<ByteArray>()
+  // Kept across frames, so the JPEG encoder doesn't regrow a stream from 32 bytes every frame
+  private val _jpegStream = ByteArrayOutputStream()
 
   fun getCameraMinFocalLength(): Float? {
     var minFocalLength: Float? = null
@@ -320,17 +326,30 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
     return Bitmap.createBitmap(original, 0, 0, original.width, original.height, matrix, true)
   }
 
+  // Takes a frame array of the given size from the pool, or allocates one
+  private fun takeNv21(size: Int): ByteArray =
+      synchronized(_nv21Pool) { _nv21Pool.removeFirstOrNull() }?.takeIf { it.size == size }
+          ?: ByteArray(size)
+
+  // Returns a frame array to the pool once nothing reads it any more
+  private fun giveNv21(nv21: ByteArray) {
+    synchronized(_nv21Pool) {
+      if (_nv21Pool.size < NV21_POOL_SIZE) _nv21Pool.addLast(nv21)
+    }
+  }
+
   private fun compressNv21(
       nv21: ByteArray,
       width: Int,
       height: Int,
       quality: Int = JPEG_QUALITY
-  ): ByteArray {
-    val out = ByteArrayOutputStream()
-    val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-    yuvImage.compressToJpeg(Rect(0, 0, width, height), quality, out)
-    return out.toByteArray()
-  }
+  ): ByteArray =
+      synchronized(_jpegStream) {
+        _jpegStream.reset()
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+        yuvImage.compressToJpeg(Rect(0, 0, width, height), quality, _jpegStream)
+        _jpegStream.toByteArray()
+      }
 
   private fun setNextFrame(image: ByteArray) {
     synchronized(_latestFrameInfo) {
@@ -427,15 +446,17 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
     val frameSize = crop.width() * crop.height() * 3 / 2
     // The native conversion copies only the crop area out of the camera buffers. WebRTC turns
     // frames upright from the stream's metadata, so it gets them as captured.
-    val nv21 = ByteArray(frameSize)
+    val nv21 = takeNv21(frameSize)
     if (nativeUtils.toNv21(image, crop, 0, nv21)) {
-      _webRTCManager.pushFrame(nv21, crop.width(), crop.height(), rotation)
+      _webRTCManager.pushFrame(nv21, crop.width(), crop.height(), rotation) { giveNv21(nv21) }
+    } else {
+      giveNv21(nv21)
     }
 
     // The JPEG encode is the expensive part, so skip it when only WebRTC is watching
     if (_mjpegListenerCnt.get() > 0) {
       // Turned upright during the conversion
-      val upright = ByteArray(frameSize)
+      val upright = takeNv21(frameSize)
       if (nativeUtils.toNv21(image, crop, rotation, upright)) {
         val quarterTurn = rotation == 90 || rotation == 270
         setNextFrame(
@@ -444,6 +465,7 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
                 if (quarterTurn) crop.height() else crop.width(),
                 if (quarterTurn) crop.width() else crop.height()))
       }
+      giveNv21(upright)
     }
     image.close()
     sleepToLimitFps()

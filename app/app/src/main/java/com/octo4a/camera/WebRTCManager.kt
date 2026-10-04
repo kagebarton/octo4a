@@ -146,18 +146,20 @@ class WebRTCManager(private val context: Context) {
         peerEvents.shutdown()
     }
 
-    fun pushFrame(nv21: ByteArray, width: Int, height: Int, rotation: Int) {
-        if (!streaming) return
-        synchronized(frameLock) {
-            val source = videoSource ?: return
-            try {
-                val buffer = NV21Buffer(nv21, width, height, null)
-                val frame = VideoFrame(buffer, rotation, System.nanoTime())
-                source.capturerObserver.onFrameCaptured(frame)
-                frame.release()
-            } catch (e: Exception) {
-                e.printStackTrace()
+    // Sends a frame to the connected peers. release runs once libwebrtc is done with nv21, which
+    // can be after pushFrame returns.
+    fun pushFrame(nv21: ByteArray, width: Int, height: Int, rotation: Int, release: () -> Unit = {}) {
+        val buffer = NV21Buffer(nv21, width, height, Runnable { release() })
+        try {
+            if (streaming) {
+                synchronized(frameLock) {
+                    videoSource?.capturerObserver?.onFrameCaptured(VideoFrame(buffer, rotation, System.nanoTime()))
+                }
             }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        } finally {
+            buffer.release()
         }
     }
 
