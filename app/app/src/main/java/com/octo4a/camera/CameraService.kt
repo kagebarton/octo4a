@@ -49,6 +49,8 @@ import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -86,16 +88,13 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
     callback?.invoke(this)
   }
 
-  data class LatestFrameInfo(
-      val waitEvent: WaitableEvent = WaitableEvent(),
-      var frameInfo: MJpegFrameProvider.FrameInfo
-  )
-
   private val _cameraSettings: MainPreferences by inject()
   private val _logger: LoggerRepository by inject()
 
-  private val _latestFrameInfo: LatestFrameInfo =
-      LatestFrameInfo(frameInfo = MJpegFrameProvider.FrameInfo(id = 1))
+  // The latest MJPEG frame. Each new one wakes every waiting client.
+  private val _frameLock = ReentrantLock()
+  private val _newFrame = _frameLock.newCondition()
+  private var _latestFrame = MJpegFrameProvider.FrameInfo(id = 1)
 
   private var _cameraProcessProvider: ProcessCameraProvider? = null
   private val _cameraBoundUseCases: MutableMap<UseCase, CompletableInitState> = HashMap()
@@ -352,21 +351,22 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
       }
 
   private fun setNextFrame(image: ByteArray) {
-    synchronized(_latestFrameInfo) {
-      _latestFrameInfo.frameInfo =
-          _latestFrameInfo.frameInfo.copy(image = image, id = _latestFrameInfo.frameInfo.id + 1)
+    _frameLock.withLock {
+      _latestFrame = MJpegFrameProvider.FrameInfo(image, _latestFrame.id + 1)
+      _newFrame.signalAll()
     }
-    _latestFrameInfo.waitEvent.set()
   }
 
-  override fun getNewFrame(prevFrame: MJpegFrameProvider.FrameInfo?): MJpegFrameProvider.FrameInfo {
-    while (_latestFrameInfo.frameInfo.id <= (prevFrame?.id ?: 0)) {
-      _latestFrameInfo.waitEvent.wait(autoreset = true)
-    }
-    synchronized(_latestFrameInfo) {
-      return _latestFrameInfo.frameInfo.copy()
-    }
-  }
+  // A new client (no prevFrame) waits for the next frame too: frames are only encoded while
+  // someone watches MJPEG, so the latest one can be from long ago
+  override fun getNewFrame(prevFrame: MJpegFrameProvider.FrameInfo?): MJpegFrameProvider.FrameInfo =
+      _frameLock.withLock {
+        val lastId = prevFrame?.id ?: _latestFrame.id
+        while (_latestFrame.id <= lastId) {
+          _newFrame.await()
+        }
+        _latestFrame
+      }
 
   inner class LocalBinder : Binder() {
     fun getService(): CameraService = this@CameraService
