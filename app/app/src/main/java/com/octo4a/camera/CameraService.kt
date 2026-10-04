@@ -441,20 +441,41 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
   }
 
   private fun analyzeFrame(image: ImageProxy) {
+    try {
+      sendFrame(image)
+    } catch (e: Exception) {
+      // CameraX doesn't catch what an analyzer throws, so it would kill the app
+      e.printStackTrace()
+    } finally {
+      // The next frame only arrives once this one is closed
+      image.close()
+    }
+    sleepToLimitFps()
+  }
+
+  // Converts a camera frame for the streams someone is watching
+  private fun sendFrame(image: ImageProxy) {
+    val toWebRTC = _webRTCManager.isStreaming
+    // The JPEG encode is the expensive part, so skip it when only WebRTC is watching
+    val toMjpeg = _mjpegListenerCnt.get() > 0
+    // Frames keep coming while the camera waits to unbind
+    if (!toWebRTC && !toMjpeg) return
+
     val rotation: Int = image.imageInfo.rotationDegrees
     val crop = videoCrop(image.width, image.height, rotation)
     val frameSize = crop.width() * crop.height() * 3 / 2
     // The native conversion copies only the crop area out of the camera buffers. WebRTC turns
     // frames upright from the stream's metadata, so it gets them as captured.
-    val nv21 = takeNv21(frameSize)
-    if (nativeUtils.toNv21(image, crop, 0, nv21)) {
-      _webRTCManager.pushFrame(nv21, crop.width(), crop.height(), rotation) { giveNv21(nv21) }
-    } else {
-      giveNv21(nv21)
+    if (toWebRTC) {
+      val nv21 = takeNv21(frameSize)
+      if (nativeUtils.toNv21(image, crop, 0, nv21)) {
+        _webRTCManager.pushFrame(nv21, crop.width(), crop.height(), rotation) { giveNv21(nv21) }
+      } else {
+        giveNv21(nv21)
+      }
     }
 
-    // The JPEG encode is the expensive part, so skip it when only WebRTC is watching
-    if (_mjpegListenerCnt.get() > 0) {
+    if (toMjpeg) {
       // Turned upright during the conversion
       val upright = takeNv21(frameSize)
       if (nativeUtils.toNv21(image, crop, rotation, upright)) {
@@ -467,8 +488,6 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
       }
       giveNv21(upright)
     }
-    image.close()
-    sleepToLimitFps()
   }
 
   override fun registerListener(): Boolean {

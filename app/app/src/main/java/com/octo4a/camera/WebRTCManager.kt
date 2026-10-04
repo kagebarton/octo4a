@@ -48,6 +48,8 @@ class WebRTCManager(private val context: Context) {
     // Oldest first, for eviction
     private val peers = LinkedHashMap<String, Peer>()
     @Volatile private var streaming = false
+    // Whether a peer is connected, so frames are wanted
+    val isStreaming: Boolean get() = streaming
 
     // Called on peerEvents when the first peer connects and after the last one closes
     @Volatile var onStreamActiveStatusChanged: ((Boolean) -> Unit)? = null
