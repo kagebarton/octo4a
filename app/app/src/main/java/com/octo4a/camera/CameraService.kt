@@ -302,24 +302,6 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
     return Rect(left, top, left + cropWidth, top + cropHeight)
   }
 
-  // Crops an already converted NV21 frame, for the I420 path that converts in Kotlin
-  private fun cropNv21(nv21: ByteArray, width: Int, height: Int, crop: Rect): ByteArray {
-    if (crop.width() == width && crop.height() == height) {
-      return nv21
-    }
-    val cropped = ByteArray(crop.width() * crop.height() * 3 / 2)
-    for (row in 0 until crop.height()) {
-      System.arraycopy(nv21, (crop.top + row) * width + crop.left, cropped, row * crop.width(), crop.width())
-    }
-    // Interleaved VU rows follow Y at half the count; an even left keeps each V/U pair whole
-    val vuIn = width * height
-    val vuOut = crop.width() * crop.height()
-    for (row in 0 until crop.height() / 2) {
-      System.arraycopy(nv21, vuIn + (crop.top / 2 + row) * width + crop.left, cropped, vuOut + row * crop.width(), crop.width())
-    }
-    return cropped
-  }
-
   private fun getBestAvailFps(): Int {
     val targetFps = _cameraSettings.fpsLimit?.toIntOrNull() ?: -1
     val availableFps =
@@ -440,29 +422,28 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
   }
 
   private fun analyzeFrame(image: ImageProxy) {
-    val isI420 = (image.planes[1].pixelStride == 1)
     val rotation: Int = image.imageInfo.rotationDegrees
     val crop = videoCrop(image.width, image.height, rotation)
-    // The native path copies only the crop area out of the camera buffers
-    var nv21: ByteArray =
-        if (isI420) cropNv21(nativeUtils.yuvToNv21Slow(image), image.width, image.height, crop)
-        else nativeUtils.toNv21(image, crop)!!
-
-    _webRTCManager.pushFrame(nv21, crop.width(), crop.height(), rotation)
+    val frameSize = crop.width() * crop.height() * 3 / 2
+    // The native conversion copies only the crop area out of the camera buffers. WebRTC turns
+    // frames upright from the stream's metadata, so it gets them as captured.
+    val nv21 = ByteArray(frameSize)
+    if (nativeUtils.toNv21(image, crop, 0, nv21)) {
+      _webRTCManager.pushFrame(nv21, crop.width(), crop.height(), rotation)
+    }
 
     // The JPEG encode is the expensive part, so skip it when only WebRTC is watching
     if (_mjpegListenerCnt.get() > 0) {
-      var realWidth = crop.width()
-      var realHeight = crop.height()
-
-      if (rotation > 0) {
-        nv21 = RotateUtils.rotate(nv21, realWidth, realHeight, rotation)!!
-        if (rotation != 180) {
-          realWidth = crop.height()
-          realHeight = crop.width()
-        }
+      // Turned upright during the conversion
+      val upright = ByteArray(frameSize)
+      if (nativeUtils.toNv21(image, crop, rotation, upright)) {
+        val quarterTurn = rotation == 90 || rotation == 270
+        setNextFrame(
+            compressNv21(
+                upright,
+                if (quarterTurn) crop.height() else crop.width(),
+                if (quarterTurn) crop.width() else crop.height()))
       }
-      setNextFrame(compressNv21(nv21, realWidth, realHeight))
     }
     image.close()
     sleepToLimitFps()
