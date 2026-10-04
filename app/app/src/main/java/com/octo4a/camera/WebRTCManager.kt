@@ -39,7 +39,6 @@ class WebRTCManager(private val context: Context) {
     }
 
     private val peerEvents = Executors.newSingleThreadScheduledExecutor { Thread(it, "WebRTCPeerEvents") }
-    private var eglBase: EglBase? = null
     private var factory: PeerConnectionFactory? = null
     // pushFrame runs on the camera thread, so release swaps the source out under frameLock
     private val frameLock = Any()
@@ -100,22 +99,16 @@ class WebRTCManager(private val context: Context) {
             // drops it when the service is destroyed, and release's unregister then aborts.
             PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(context.applicationContext)
-                    .setEnableInternalTracer(true)
                     .createInitializationOptions()
             )
 
-            eglBase = EglBase.create()
-            val options = PeerConnectionFactory.Options()
-
-            val defaultVideoEncoderFactory = DefaultVideoEncoderFactory(
-                eglBase?.eglBaseContext,  /* enableIntelVp8Encoder */ true,  /* enableH264HighProfile */ true
-            )
-            val defaultVideoDecoderFactory = DefaultVideoDecoderFactory(eglBase?.eglBaseContext)
-
+            // Frames arrive as NV21 arrays, not GL textures, so neither factory needs an EGL
+            // context. Nothing is decoded, but codec negotiation still lists the decoders.
+            val noEglContext: EglBase.Context? = null
             factory = PeerConnectionFactory.builder()
-                .setOptions(options)
-                .setVideoEncoderFactory(defaultVideoEncoderFactory)
-                .setVideoDecoderFactory(defaultVideoDecoderFactory)
+                .setVideoEncoderFactory(DefaultVideoEncoderFactory(
+                    noEglContext,  /* enableIntelVp8Encoder */ true,  /* enableH264HighProfile */ true))
+                .setVideoDecoderFactory(DefaultVideoDecoderFactory(noEglContext))
                 .createPeerConnectionFactory()
 
             val source = factory?.createVideoSource(false)
@@ -139,10 +132,8 @@ class WebRTCManager(private val context: Context) {
             localVideoTrack?.dispose()
             source?.dispose()
             factory?.dispose()
-            eglBase?.release()
             localVideoTrack = null
             factory = null
-            eglBase = null
         }
         // Tasks already queued or delayed still run, and find no peers
         peerEvents.shutdown()
