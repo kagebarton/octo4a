@@ -5,6 +5,9 @@ import android.util.Log
 import org.webrtc.*
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
@@ -14,6 +17,8 @@ class WebRTCManager(private val context: Context) {
         private const val TAG = "WebRTCManager"
         // Browsers only expose a track in ontrack's streams if it was added with a stream id
         private const val STREAM_ID = "octo4a"
+        // ICE reports DISCONNECTED on brief network drops and often recovers by itself
+        private const val DISCONNECT_GRACE_SECONDS = 15L
     }
 
     private var eglBase: EglBase? = null
@@ -26,10 +31,18 @@ class WebRTCManager(private val context: Context) {
     var onStreamActiveStatusChanged: ((Boolean) -> Unit)? = null
     private val activePeerIds = ConcurrentHashMap.newKeySet<String>()
 
+    // Runs peer state changes one at a time, off libwebrtc's signaling thread: they can block
+    // on the camera bind, and a disconnect timer's close must not interleave with ICE updates.
+    private val peerEvents = Executors.newSingleThreadScheduledExecutor { Thread(it, "WebRTCPeerEvents") }
+    // Pending closes of peers whose ICE is disconnected. Only used on peerEvents.
+    private val disconnectTimers = HashMap<String, ScheduledFuture<*>>()
+
+    // Runs on peerEvents, so the empty/non-empty transitions below can't interleave.
     private fun updatePeerStatus(id: String, connected: Boolean) {
         val wasEmpty = activePeerIds.isEmpty()
         if (connected) {
-            activePeerIds.add(id)
+            // A CONNECTED queued behind a disconnect timer can arrive after the timer closed the peer
+            if (peerConnectionsById.containsKey(id)) activePeerIds.add(id)
         } else {
             activePeerIds.remove(id)
             peerConnectionsById.remove(id)?.close()
@@ -84,13 +97,7 @@ class WebRTCManager(private val context: Context) {
     private fun peerObserver(id: String, onGatheringComplete: () -> Unit) = object : PeerConnection.Observer {
         override fun onSignalingChange(p0: PeerConnection.SignalingState?) {}
         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
-            if (state == PeerConnection.IceConnectionState.CONNECTED) {
-                updatePeerStatus(id, true)
-            } else if (state == PeerConnection.IceConnectionState.DISCONNECTED ||
-                state == PeerConnection.IceConnectionState.FAILED ||
-                state == PeerConnection.IceConnectionState.CLOSED) {
-                updatePeerStatus(id, false)
-            }
+            peerEvents.execute { onIceConnectionState(id, state) }
         }
         override fun onIceConnectionReceivingChange(p0: Boolean) {}
         override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
@@ -103,6 +110,32 @@ class WebRTCManager(private val context: Context) {
         override fun onDataChannel(p0: DataChannel?) {}
         override fun onRenegotiationNeeded() {}
         override fun onAddTrack(p0: RtpReceiver?, p1: Array<out MediaStream>?) {}
+    }
+
+    // Runs on peerEvents. A DISCONNECTED peer gets time to recover before it's closed: OctoPrint
+    // doesn't reconnect, so closing on a brief drop would freeze its stream until a page reload.
+    private fun onIceConnectionState(id: String, state: PeerConnection.IceConnectionState?) {
+        when (state) {
+            PeerConnection.IceConnectionState.CONNECTED,
+            PeerConnection.IceConnectionState.COMPLETED -> {
+                disconnectTimers.remove(id)?.cancel(false)
+                updatePeerStatus(id, true)
+            }
+            PeerConnection.IceConnectionState.DISCONNECTED -> {
+                if (!disconnectTimers.containsKey(id)) {
+                    disconnectTimers[id] = peerEvents.schedule(Runnable {
+                        disconnectTimers.remove(id)
+                        updatePeerStatus(id, false)
+                    }, DISCONNECT_GRACE_SECONDS, TimeUnit.SECONDS)
+                }
+            }
+            PeerConnection.IceConnectionState.FAILED,
+            PeerConnection.IceConnectionState.CLOSED -> {
+                disconnectTimers.remove(id)?.cancel(false)
+                updatePeerStatus(id, false)
+            }
+            else -> {}
+        }
     }
 
     // SdpObserver for one create or set call. onSuccess gets the created description, or null after a set.
