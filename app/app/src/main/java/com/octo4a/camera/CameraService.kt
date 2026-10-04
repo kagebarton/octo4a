@@ -617,7 +617,10 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
       }
     }
     if (waitForInitNeeded) {
+      // Another caller is binding. Start over once it's done, so this caller takes its own
+      // reference; returning without one would let that caller's deinit unbind under this one.
       initState.waitEvent.wait()
+      return initUseCase(useCase, block)
     }
     if (initState.state != InitState.INITIALIZING) {
       return (initState.state == InitState.INITIALIZED)
