@@ -283,11 +283,16 @@ class WebRTCManager(private val context: Context) {
         return Pair(id, sdp)
     }
 
+    // Browsers speak Unified Plan SDP; this library defaults to Plan B
+    private fun rtcConfiguration() = PeerConnection.RTCConfiguration(emptyList()).apply {
+        sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+    }
+
     // Creates an offer (server is the offerer, matching camera-streamer API).
     // Returns a pair of (id, offerSdp). Waits for ICE gathering to complete.
     suspend fun createOffer(): Pair<String, String> =
-        newPeer(PeerConnection.RTCConfiguration(emptyList())) { id, pc, fail ->
-            pc.addTrack(localVideoTrack)
+        newPeer(rtcConfiguration()) { id, pc, fail ->
+            pc.addTrack(localVideoTrack, listOf(STREAM_ID))
             pc.createOffer(SdpCallback(id, fail) { offer ->
                 pc.setLocalDescription(SdpCallback(id, fail) {
                     // ICE gathering starts; newPeer returns once it's complete
@@ -317,12 +322,8 @@ class WebRTCManager(private val context: Context) {
 
     // Answers a client's offer (client is the offerer, as OctoPrint's webrtc:// webcam does).
     // Returns a pair of (id, answerSdp). Waits for ICE gathering to complete.
-    suspend fun answerOffer(offerSdp: String): Pair<String, String> {
-        // Browsers offer Unified Plan SDP; this library defaults to Plan B
-        val config = PeerConnection.RTCConfiguration(emptyList()).apply {
-            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-        }
-        return newPeer(config) { id, pc, fail ->
+    suspend fun answerOffer(offerSdp: String): Pair<String, String> =
+        newPeer(rtcConfiguration()) { id, pc, fail ->
             pc.setRemoteDescription(SdpCallback(id, fail) {
                 // Reuses the recvonly video transceiver from the offer; its audio one stays inactive
                 pc.addTrack(localVideoTrack, listOf(STREAM_ID))
@@ -337,16 +338,17 @@ class WebRTCManager(private val context: Context) {
                 }, MediaConstraints())
             }, SessionDescription(SessionDescription.Type.OFFER, preferH264(offerSdp)))
         }
-    }
 
-    // Sets the client's answer SDP as remote description for the given peer connection id.
+    // Sets the client's answer SDP as remote description for the given peer connection id. The
+    // phone sends with the answer's first codec, and browsers answer in our offer's order, which
+    // lists VP8 first, so H.264 is moved up as in offers we answer.
     suspend fun processAnswer(id: String, answerSdp: String): Boolean = awaitPeerEvents(false) { finish ->
         val pc = peers[id]?.pc
         if (pc == null) {
             finish(false)
         } else {
             pc.setRemoteDescription(SdpCallback(id, { finish(false) }) { finish(true) },
-                SessionDescription(SessionDescription.Type.ANSWER, answerSdp))
+                SessionDescription(SessionDescription.Type.ANSWER, preferH264(answerSdp)))
         }
     }
 
