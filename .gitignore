@@ -110,7 +110,6 @@ unlinked_spec.ds
 
 # Coverage
 coverage/
-camera-streamer/
 
 # Exceptions to above rules.
 !**/ios/**/default.mode1v3
