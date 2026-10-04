@@ -94,8 +94,10 @@ class WebRTCManager(private val context: Context) {
 
     fun init() {
         post {
+            // WebRTC registers its network monitor's receiver on this context. A service context
+            // drops it when the service is destroyed, and release's unregister then aborts.
             PeerConnectionFactory.initialize(
-                PeerConnectionFactory.InitializationOptions.builder(context)
+                PeerConnectionFactory.InitializationOptions.builder(context.applicationContext)
                     .setEnableInternalTracer(true)
                     .createInitializationOptions()
             )
