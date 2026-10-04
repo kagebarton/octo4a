@@ -26,6 +26,10 @@ interface MJpegFrameProvider {
 
 // Simple http server hosting mjpeg stream along with
 class MJpegServer(port: Int, private val frameProvider: MJpegFrameProvider): NanoHTTPD(port) {
+    companion object {
+        // Browser SDP offers are a few KB
+        private const val MAX_WEBRTC_BODY_BYTES = 64 * 1024L
+    }
 
     override fun serve(session: IHTTPSession?): Response {
         when (session?.uri) {
@@ -64,6 +68,12 @@ class MJpegServer(port: Int, private val frameProvider: MJpegFrameProvider): Nan
                 }
                 
                 if (session.method == Method.POST) {
+                    // parseBody spools the whole body to a temp file and then reads it into
+                    // memory, so a huge Content-Length fills the disk and then the heap.
+                    val bodySize = session.headers["content-length"]?.toLongOrNull() ?: 0L
+                    if (bodySize > MAX_WEBRTC_BODY_BYTES) {
+                        return newFixedLengthResponse(Response.Status.PAYLOAD_TOO_LARGE, "text/plain", "Payload Too Large")
+                    }
                     val map = HashMap<String, String>()
                     try {
                         session.parseBody(map)
@@ -169,7 +179,9 @@ class MJpegServer(port: Int, private val frameProvider: MJpegFrameProvider): Nan
                                     return res
                                 }
                             }
-                        } catch (e: Exception) {
+                        } catch (e: Throwable) {
+                            // Deeply nested JSON overflows org.json's recursive parser. NanoHTTPD
+                            // only catches Exception, so an uncaught Error would kill the app.
                             e.printStackTrace()
                         }
                     }
