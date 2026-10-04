@@ -166,7 +166,7 @@ class CameraService : LifecycleService(), MJpegFrameProvider {
     ret
   }
 
-  @SuppressLint("RestrictedApi")
+  @Suppress("RestrictedApi")
   private val _imageAnalysis by lazy {
     val builder =
         ImageAnalysis.Builder()
