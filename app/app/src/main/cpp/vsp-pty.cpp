@@ -27,6 +27,10 @@ jweak storeWeakListener;
 jclass serialDataClass;
 jmethodID serialDataConstructor;
 pthread_t ptyThreadHandle = 0;
+// OctoPrintService starts the pty thread from onCreate and again from verifyPtyRunning while the serialpipe
+// symlink doesn't exist yet, so two callers can race here. Two pty threads both read the shared master and
+// each writes what it read to the USB port, so back-to-back lines can reach the printer swapped.
+static pthread_mutex_t ptyThreadLock = PTHREAD_MUTEX_INITIALIZER;
 
 static jint getBaudrate(speed_t baudrate)
 {
@@ -284,9 +288,11 @@ extern "C"
 
     JNIEXPORT void JNICALL Java_com_octo4a_serial_VSPPty_runPtyThread(JNIEnv *env, jobject instance)
     {
+        pthread_mutex_lock(&ptyThreadLock);
         if (ptyThreadHandle == 0) {
             pthread_create(&ptyThreadHandle, nullptr, &ptyThread, nullptr);
         }
+        pthread_mutex_unlock(&ptyThreadLock);
     }
 
     JNIEXPORT void JNICALL Java_com_octo4a_serial_VSPPty_cancelPtyThread(JNIEnv *env, jobject instance)
