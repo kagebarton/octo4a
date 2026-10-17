@@ -262,6 +262,9 @@ extern "C"
         jsize numBytes = env->GetArrayLength(data);
         jbyte *lib = env->GetByteArrayElements(data, 0);
         write(master, lib, numBytes);
+        // Without this every chunk from the printer leaks its copy for the life of the process. JNI_ABORT: we
+        // only read the buffer, so there is nothing to copy back.
+        env->ReleaseByteArrayElements(data, lib, JNI_ABORT);
         //    fflush(master);
     }
 
