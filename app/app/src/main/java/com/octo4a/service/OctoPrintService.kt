@@ -108,8 +108,7 @@ class OctoPrintService : LifecycleService() {
         bootstrapRepository.ensureHomeDirectory()
 
         scope.launch {
-            virtualSerialDriver.initializeVSP()
-            virtualSerialDriver.handlePtyThread()
+            virtualSerialDriver.startVSP()
             handlerRepository.beginInstallation()
         }
 
@@ -140,8 +139,7 @@ class OctoPrintService : LifecycleService() {
     fun verifyPtyRunning() {
         val ptyFile = File("/data/data/com.octo4a/files/serialpipe")
         if (!ptyFile.exists()) {
-            virtualSerialDriver.initializeVSP()
-            virtualSerialDriver.handlePtyThread()
+            virtualSerialDriver.startVSP()
         }
     }
 

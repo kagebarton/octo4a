@@ -18,6 +18,7 @@ import com.octo4a.utils.preferences.MainPreferences
 import kotlinx.coroutines.flow.MutableStateFlow
 import java.lang.Exception
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class SerialDriverClass {
     PROLIFIC,
@@ -65,11 +66,22 @@ class VirtualSerialDriver(val context: Context, private val prefs: MainPreferenc
         val usbPermissionRequestCode = 2212
     }
 
-    fun initializeVSP() {
+    // OctoPrintService calls startVSP from onCreate and again from verifyPtyRunning until the serialpipe symlink
+    // appears. The native side already starts only one pty thread, but every extra setVSPListener leaks two JNI
+    // refs and rewrites globals the running pty thread reads, so only the first call gets through.
+    private val vspStarted = AtomicBoolean(false)
+
+    fun startVSP() {
+        if (!vspStarted.compareAndSet(false, true)) return
+        initializeVSP()
+        handlePtyThread()
+    }
+
+    private fun initializeVSP() {
         pty.setVSPListener(this)
     }
 
-    fun handlePtyThread() {
+    private fun handlePtyThread() {
         ptyThread = Thread {
             pty.runPtyThread()
         }
